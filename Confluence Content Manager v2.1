@@ -1,0 +1,226 @@
+import requests
+import csv
+from getpass import getpass
+from atlassian import Confluence
+
+# Session state
+session = {
+    "base_url": "https://your-confluence-site.atlassian.net",  # Update with your base URL
+    "space_key": "SPACE",  # Update with your space key
+    "username": None,
+    "api_token": None,
+    "query": None,
+}
+
+# Fetch limit for testing
+FETCH_LIMIT = 10  # Set to None for no limit
+
+
+# Authenticate user
+def authenticate():
+    """
+    Authenticate user by prompting for username and API token.
+    Caches the token in the session for reuse.
+    """
+    if not session["username"]:
+        session["username"] = input("Enter your Confluence username (email): ").strip()
+    if not session["api_token"]:
+        session["api_token"] = getpass("Enter your Confluence API token (hidden): ")
+
+    print("Authentication successful.")
+    return Confluence(
+        url=session["base_url"],
+        username=session["username"],
+        password=session["api_token"],
+        cloud=True,
+    )
+
+
+# Fetch space structure
+def fetch_space_structure(confluence):
+    """
+    Fetches all pages in the space and filters for top-level pages (0 or 1 ancestor).
+    """
+    print("\nFetching all pages in the space...")
+    results = confluence.get_all_pages_from_space(
+        space=session["space_key"], limit=FETCH_LIMIT or 100, expand="ancestors"
+    )
+
+    # Filter pages to include those with 0 or 1 ancestor (considered "top-level")
+    top_level_pages = [
+        {
+            "title": page.get("title", "Untitled"),
+            "id": page.get("id", "Unknown"),
+            "ancestor_count": len(page.get("ancestors", [])),
+        }
+        for page in results
+        if len(page.get("ancestors", [])) <= 1
+    ]
+
+    if top_level_pages:
+        print("\nSpace Structure (Top Pages):")
+        for page in top_level_pages:
+            print(f"- {page['title']} (ID: {page['id']}) [Ancestors: {page['ancestor_count']}]")
+    else:
+        print("No top-level pages found.")
+    return top_level_pages
+
+
+# Validate query input
+def validate_query(query):
+    """
+    Validate user input for query and catch common errors.
+    """
+    if not query.strip():
+        return "Query cannot be empty."
+    if "text~" in query and "'" not in query:
+        return "Keyword searches must be enclosed in single quotes."
+    return None
+
+
+# Build query dynamically
+def query_builder(confluence):
+    """
+    Build or edit a Confluence query interactively based on user choices.
+    """
+    print("\nDo you want to see the current space structure to assist in building your query?")
+    show_structure = input("Type 'yes' to see structure, or press Enter to skip: ").strip().lower()
+
+    if show_structure == "yes":
+        fetch_space_structure(confluence)
+
+    print("\nSelect a query option:")
+    print("1. Search by keyword (e.g., find pages mentioning a specific term)")
+    print("2. Find recently updated pages (e.g., changes in the past X days)")
+    print("3. Search specific sections (e.g., pages under a specific section)")
+    print("4. Custom query (use advanced Confluence Query Language)")
+
+    choice = input("Enter your choice (1-4): ").strip()
+
+    if choice == "1":
+        keyword = input("Enter a keyword to search for: ").strip()
+        session["query"] = f"text~'{keyword}' AND space='{session['space_key']}'"
+    elif choice == "2":
+        days = input("Enter the number of days to look back: ").strip()
+        session["query"] = f"lastModified > now(-{days}d) AND space='{session['space_key']}'"
+    elif choice == "3":
+        ancestor = input("Enter the ancestor ID or section name: ").strip()
+        session["query"] = f"ancestor={ancestor} AND space='{session['space_key']}'"
+    elif choice == "4":
+        print("\nEnter your custom query in Confluence Query Language (CQL).")
+        session["query"] = input("Custom query: ").strip()
+    else:
+        print("Invalid choice. Defaulting to keyword search.")
+        keyword = input("Enter a keyword to search for: ").strip()
+        session["query"] = f"text~'{keyword}' AND space='{session['space_key']}'"
+
+    # Validate query
+    error = validate_query(session["query"])
+    if error:
+        print(f"Query error: {error}")
+        return query_builder(confluence)
+
+
+# Fetch data from Confluence
+def fetch_confluence_data(confluence):
+    """
+    Fetches data from Confluence using CQL and returns the results.
+    """
+    start = 0
+    results = []
+
+    print("\nFetching results from Confluence...")
+    while True:
+        batch = confluence.cql(
+            cql=session["query"],
+            limit=min(FETCH_LIMIT or 100, 100),
+            start=start,
+        )["results"]
+
+        if not batch:
+            break
+
+        results.extend(batch)
+        if FETCH_LIMIT and len(results) >= FETCH_LIMIT:
+            break
+        start += 100
+
+    print(f"Fetched {len(results)} results.")
+    return results
+
+
+# Save results to CSV
+def save_to_csv(results):
+    """
+    Saves Confluence search results to a CSV file.
+    """
+    csv_file = f"confluence_export_{session['space_key']}.csv"
+    with open(csv_file, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Index", "Title", "URL", "Page ID", "Last Modified", "Author"])  # CSV header
+
+        for idx, result in enumerate(results, start=1):
+            title = result.get("title", "Untitled")
+            page_id = result.get("id", "Unknown")
+            link = f"{session['base_url']}/wiki{result['_links']['webui']}"
+            modified = result.get("version", {}).get("when", "N/A")
+            author = result.get("version", {}).get("by", {}).get("displayName", "Unknown")
+            writer.writerow([idx, title, link, page_id, modified, author])
+
+    print(f"\nResults saved to: {csv_file}")
+    return csv_file
+
+
+# Check and append macros
+def check_and_append_macros(confluence, results):
+    """
+    Check and append the version history macro if not already present on the pages.
+    """
+    for result in results:
+        page_id = result.get("id")
+        title = result.get("title", "Untitled")
+
+        content = confluence.get_page_by_id(page_id, expand="body.storage")
+        body = content["body"]["storage"]["value"]
+
+        if "expand" not in body or "version history" not in body.lower():
+            print(f"Adding version history macro to: {title} (ID: {page_id})")
+            new_body = (
+                f"<ac:macro ac:name='expand'><ac:parameter ac:name='title'>Version History</ac:parameter>"
+                f"<ac:structured-macro ac:name='view-history'/></ac:macro>{body}"
+            )
+            confluence.update_page(page_id, title, new_body)
+        else:
+            print(f"Version history macro already exists on: {title} (ID: {page_id})")
+
+
+# Main tool
+def confluence_tool():
+    """
+    Main function to run the Confluence tool.
+    """
+    confluence = authenticate()
+
+    # Build query
+    query_builder(confluence)
+
+    # Fetch data
+    results = fetch_confluence_data(confluence)
+    if not results:
+        print("No results found. Exiting.")
+        return
+
+    # Save results to CSV
+    csv_file = save_to_csv(results)
+
+    # Prompt for edits
+    edit_prompt = input("\nDo you want to edit the fetched pages? (yes/no): ").strip().lower()
+    if edit_prompt == "yes":
+        check_and_append_macros(confluence, results)
+    else:
+        print("Exiting without making edits.")
+
+
+# Run the tool
+if __name__ == "__main__":
+    confluence_tool()
