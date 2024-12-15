@@ -1,0 +1,423 @@
+import requests
+import csv
+import logging
+from getpass import getpass
+from atlassian import Confluence
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Session state
+session = {
+    "base_url": "https://your-confluence-site.atlassian.net",  # Update with your base URL
+    "space_key": "SPACE",  # Update with your space key
+    "username": None,
+    "api_token": None,
+    "query": None,
+    "fetch_limit": None  # Set None for no limit, or an integer for testing
+}
+
+# Global Dry Run flag
+dry_run = False
+
+
+def authenticate():
+    """
+    Authenticate user by prompting for username and API token.
+    Caches the token in the session for reuse.
+    """
+    if not session["username"]:
+        session["username"] = input("Enter your Confluence username (email): ").strip()
+    if not session["api_token"]:
+        session["api_token"] = getpass("Enter your Confluence API token (hidden): ")
+    try:
+        confluence = Confluence(
+            url=session["base_url"],
+            username=session["username"],
+            password=session["api_token"],
+            cloud=True,
+        )
+        # Test authentication by getting current user
+        current_user = confluence.get_current_user()
+        if current_user:
+            logging.info("Authentication successful.")
+            return confluence
+        else:
+            logging.error("Authentication failed. Please check your credentials and try again.")
+            exit(1)
+    except Exception as e:
+        logging.error(f"Error during authentication: {e}")
+        exit(1)
+
+
+def fetch_space_structure(confluence):
+    """
+    Fetches all pages in the space and filters for top-level pages (0 or 1 ancestor).
+    Returns a list of dicts with 'title', 'id', and 'ancestor_count'.
+    """
+    logging.info("Fetching space structure...")
+    try:
+        results = confluence.get_all_pages_from_space(
+            space=session["space_key"], 
+            limit=session["fetch_limit"] or 100, 
+            expand="ancestors"
+        )
+    except Exception as e:
+        logging.error(f"Error fetching space structure: {e}")
+        return []
+
+    top_level_pages = [
+        {
+            "title": page.get("title", "Untitled"),
+            "id": page.get("id", "Unknown"),
+            "ancestor_count": len(page.get("ancestors", [])),
+        }
+        for page in results
+        if len(page.get("ancestors", [])) <= 1
+    ]
+
+    if top_level_pages:
+        print("\nSpace Structure (Top-Level Pages):")
+        for page in top_level_pages:
+            print(f"- {page['title']} (ID: {page['id']}) [Ancestors: {page['ancestor_count']}]")
+    else:
+        logging.info("No top-level pages found.")
+    return top_level_pages
+
+
+def validate_query(query):
+    """
+    Validate user input for query and catch common errors.
+    """
+    if not query.strip():
+        return "Query cannot be empty."
+    if "text~" in query and "'" not in query:
+        return "Keyword searches must be enclosed in single quotes."
+    return None
+
+
+def advanced_query_assistance():
+    """
+    Provide advanced query assistance with common query templates.
+    Users can select a scenario and enter parameters to build a CQL query.
+    """
+    print("\nAdvanced Query Assistance:")
+    print("Select a scenario:")
+    print("1. Search pages by label")
+    print("2. Search pages by author")
+    print("3. Search pages updated within a specific date range")
+    print("4. Search pages that contain attachments")
+    print("5. Search pages mentioning a specific user")
+    print("6. Return to main query menu")
+
+    choice = input("Enter your choice (1-6): ").strip()
+
+    if choice == "1":
+        # Search pages by label
+        label = input("Enter the label to search for: ").strip()
+        return f"label = '{label}' AND space='{session['space_key']}'"
+    elif choice == "2":
+        # Search pages by author
+        author = input("Enter the author's username or display name: ").strip()
+        # Typically, searching by author may require the user key rather than display name,
+        # but we'll assume displayName works if the instance allows it.
+        return f"creator = '{author}' AND space='{session['space_key']}'"
+    elif choice == "3":
+        # Search pages updated within a specific date range
+        print("Enter the date range in 'YYYY-MM-DD' format.")
+        from_date = input("From date (inclusive): ").strip()
+        to_date = input("To date (exclusive): ").strip()
+        return f"space='{session['space_key']}' AND lastModified >= '{from_date}' AND lastModified < '{to_date}'"
+    elif choice == "4":
+        # Search pages that contain attachments
+        return f"type = page AND space='{session['space_key']}' AND attachment IS NOT EMPTY"
+    elif choice == "5":
+        # Search pages mentioning a specific user (in text)
+        user_mention = input("Enter a user or term to find in text: ").strip()
+        return f"text~'{user_mention}' AND space='{session['space_key']}'"
+    elif choice == "6":
+        # Return to main query menu
+        return None
+    else:
+        print("Invalid choice. Returning to query assistance menu.")
+        return advanced_query_assistance()
+
+
+def query_builder(confluence):
+    """
+    Build or edit a Confluence query interactively based on user choices.
+    Offers multiple query construction options including advanced assistance.
+    """
+    print("\nDo you want to see the current space structure to assist in building your query?")
+    show_structure = input("Type 'yes' to see structure, or press Enter to skip: ").strip().lower()
+
+    if show_structure == "yes":
+        fetch_space_structure(confluence)
+
+    print("\nSelect a query option:")
+    print("1. Search by keyword (e.g., find pages mentioning a specific term)")
+    print("2. Find recently updated pages (e.g., changes in the past X days)")
+    print("3. Search pages under a specific ancestor (section)")
+    print("4. Custom query (use advanced Confluence Query Language)")
+    print("5. Advanced Query Assistance (common templates)")
+
+    choice = input("Enter your choice (1-5): ").strip()
+
+    if choice == "1":
+        keyword = input("Enter a keyword to search for: ").strip()
+        session["query"] = f"text~'{keyword}' AND space='{session['space_key']}'"
+    elif choice == "2":
+        days = input("Enter the number of days to look back: ").strip()
+        if not days.isdigit():
+            logging.warning("Invalid days input. Using default: 7 days.")
+            days = 7
+        session["query"] = f"lastModified > now(-{days}d) AND space='{session['space_key']}'"
+    elif choice == "3":
+        ancestor = input("Enter the ancestor ID or section name (ID recommended): ").strip()
+        session["query"] = f"ancestor={ancestor} AND space='{session['space_key']}'"
+    elif choice == "4":
+        print("\nEnter your custom query in Confluence Query Language (CQL).")
+        session["query"] = input("Custom query: ").strip()
+    elif choice == "5":
+        # Advanced query assistance
+        advanced_query = advanced_query_assistance()
+        if advanced_query is None:
+            # User chose to return to the main query builder menu
+            return query_builder(confluence)
+        else:
+            session["query"] = advanced_query
+    else:
+        logging.warning("Invalid choice. Defaulting to keyword search.")
+        keyword = input("Enter a keyword to search for: ").strip()
+        session["query"] = f"text~'{keyword}' AND space='{session['space_key']}'"
+
+    # Validate query
+    error = validate_query(session["query"])
+    if error:
+        logging.error(f"Query error: {error}")
+        return query_builder(confluence)
+
+
+def fetch_confluence_data(confluence):
+    """
+    Fetches data from Confluence using CQL and returns the results.
+    Adheres to the fetch limit if specified.
+    """
+    start = 0
+    results = []
+    limit = session["fetch_limit"] or 100
+
+    print("\nFetching results from Confluence...")
+    try:
+        while True:
+            batch = confluence.cql(
+                cql=session["query"],
+                limit=min(limit, 100),
+                start=start,
+            )["results"]
+
+            if not batch:
+                break
+
+            results.extend(batch)
+            if session["fetch_limit"] and len(results) >= session["fetch_limit"]:
+                break
+            start += 100
+    except Exception as e:
+        logging.error(f"Error fetching data from Confluence: {e}")
+
+    logging.info(f"Fetched {len(results)} results.")
+    return results
+
+
+def filter_results(results):
+    """
+    Allow the user to filter the fetched results by author and/or title keyword.
+    Users can skip filtering by leaving inputs blank.
+    """
+    print("\nWould you like to filter the results before continuing?")
+    filter_choice = input("Type 'yes' to apply filters, or press Enter to skip: ").strip().lower()
+    if filter_choice != "yes":
+        return results
+
+    title_keyword = input("Enter a keyword to filter by title (press Enter to skip): ").strip()
+    author_keyword = input("Enter an author name to filter by (press Enter to skip): ").strip()
+
+    filtered = []
+    for result in results:
+        title = result.get("title", "")
+        author = result.get("version", {}).get("by", {}).get("displayName", "")
+        if title_keyword and title_keyword.lower() not in title.lower():
+            continue
+        if author_keyword and author_keyword.lower() not in author.lower():
+            continue
+        filtered.append(result)
+
+    logging.info(f"Filtering complete. {len(filtered)} results remain after filtering.")
+    return filtered
+
+
+def save_to_csv(results):
+    """
+    Saves Confluence search results to a CSV file.
+    Includes metadata such as Page ID, Title, URL, Last Modified, and Author.
+    """
+    csv_file = f"confluence_export_{session['space_key']}.csv"
+    try:
+        with open(csv_file, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["Index", "Title", "URL", "Page ID", "Last Modified", "Author"])  # CSV header
+
+            for idx, result in enumerate(results, start=1):
+                title = result.get("title", "Untitled")
+                page_id = result.get("id", "Unknown")
+                link = f"{session['base_url']}/wiki{result['_links']['webui']}"
+                modified = result.get("version", {}).get("when", "N/A")
+                author = result.get("version", {}).get("by", {}).get("displayName", "Unknown")
+                writer.writerow([idx, title, link, page_id, modified, author])
+
+        logging.info(f"Results saved to: {csv_file}")
+    except Exception as e:
+        logging.error(f"Error saving to CSV: {e}")
+        csv_file = None
+    return csv_file
+
+
+def check_and_append_macros(confluence, results):
+    """
+    Check each page for a "version history" macro inside an expand macro.
+    If missing, append it to the top of the page content.
+    If dry_run is True, only show what would be done.
+    """
+    for result in results:
+        page_id = result.get("id")
+        title = result.get("title", "Untitled")
+
+        try:
+            content = confluence.get_page_by_id(page_id, expand="body.storage")
+            body = content["body"]["storage"]["value"]
+
+            # Check if version history macro already exists
+            if 'ac:structured-macro ac:name="view-history"' not in body:
+                if dry_run:
+                    logging.info(f"[DRY RUN] Would add version history macro to: {title} (ID: {page_id})")
+                else:
+                    logging.info(f"Adding version history macro to: {title} (ID: {page_id})")
+                    new_body = (
+                        f"<ac:macro ac:name='expand'>"
+                        f"<ac:parameter ac:name='title'>Version History</ac:parameter>"
+                        f"<ac:structured-macro ac:name='view-history'/></ac:macro>"
+                        + body
+                    )
+                    confluence.update_page(page_id, title, new_body)
+            else:
+                logging.info(f"Version history macro already present on: {title} (ID: {page_id})")
+        except Exception as e:
+            logging.error(f"Error checking/adding macros to {title} (ID: {page_id}): {e}")
+
+
+def edit_pages(confluence, results):
+    """
+    Allow the user to replace specific terms on selected pages, with validation and comments.
+    If dry_run is True, show what would be changed without applying it.
+    """
+    # Ask user for search/replace terms
+    search_term = input("\nEnter the term you want to search for in the pages: ").strip()
+    if not search_term:
+        print("Search term cannot be empty. Skipping editing.")
+        return
+
+    replace_term = input("Enter the term you want to replace it with (press Enter to skip replacement): ").strip()
+
+    # Confirm changes
+    confirm = input(f"About to search for '{search_term}' and replace with '{replace_term}' (if provided). Continue? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Edit operation cancelled.")
+        return
+
+    for result in results:
+        page_id = result.get("id")
+        title = result.get("title", "Untitled")
+
+        try:
+            content = confluence.get_page_by_id(page_id, expand="body.storage")
+            body = content["body"]["storage"]["value"]
+
+            if search_term in body:
+                new_body = body.replace(search_term, replace_term)
+                if new_body != body:
+                    if dry_run:
+                        logging.info(f"[DRY RUN] Would update page '{title}' (ID: {page_id}) replacing '{search_term}' with '{replace_term}'.")
+                    else:
+                        comment_message = f"Replaced '{search_term}' with '{replace_term}'."
+                        logging.info(f"Updating page '{title}' (ID: {page_id}) with replacement.")
+                        confluence.update_page(
+                            page_id=page_id,
+                            title=title,
+                            body=new_body,
+                            minor_edit=False,
+                            version_comment=comment_message
+                        )
+                else:
+                    logging.info(f"No changes made to '{title}' (ID: {page_id}).")
+            else:
+                logging.info(f"The term '{search_term}' was not found in '{title}' (ID: {page_id}).")
+        except Exception as e:
+            logging.error(f"Error editing {title} (ID: {page_id}): {e}")
+
+
+def confluence_tool():
+    """
+    Main function to run the Confluence tool.
+    """
+    # Prompt for Dry Run
+    global dry_run
+    dry_choice = input("Enable Dry Run mode? (no changes will be made) (yes/no): ").strip().lower()
+    dry_run = (dry_choice == "yes")
+
+    # Optional: allow user to set a fetch limit
+    limit_input = input("Enter a fetch limit for testing (or press Enter for no limit): ").strip()
+    if limit_input.isdigit():
+        session["fetch_limit"] = int(limit_input)
+    else:
+        session["fetch_limit"] = None
+
+    confluence = authenticate()
+
+    # Build query
+    query_builder(confluence)
+
+    # Fetch data
+    results = fetch_confluence_data(confluence)
+    if not results:
+        print("No results found. Exiting.")
+        return
+
+    # Filtering results
+    results = filter_results(results)
+    if not results:
+        print("No results left after filtering. Exiting.")
+        return
+
+    # Save results to CSV
+    csv_file = save_to_csv(results)
+
+    # Prompt for macro edits
+    edit_prompt = input("\nDo you want to check and append macros (version history) on the fetched pages? (yes/no): ").strip().lower()
+    if edit_prompt == "yes":
+        check_and_append_macros(confluence, results)
+    else:
+        print("Skipping macro check and append.")
+
+    # Prompt for text edits
+    text_edit_prompt = input("\nDo you want to edit page content (e.g., search and replace terms)? (yes/no): ").strip().lower()
+    if text_edit_prompt == "yes":
+        edit_pages(confluence, results)
+    else:
+        print("Skipping page content edits.")
+
+    print("Tool execution completed.")
+
+
+if __name__ == "__main__":
+    confluence_tool()
