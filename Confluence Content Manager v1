@@ -1,0 +1,192 @@
+import csv
+from getpass import getpass
+from atlassian import Confluence
+
+# Session state
+session = {
+    "base_url": "https://your-confluence-site.atlassian.net",  # Update with your base URL
+    "space_key": "SPACE",  # Update with your space key
+    "api_token": None,
+    "username": None,
+    "query": None,
+}
+
+# Authenticate user
+def authenticate():
+    """
+    Authenticate user by prompting for API token and username.
+    """
+    if not session["username"]:
+        session["username"] = input("Enter your Confluence username (email): ").strip()
+    if not session["api_token"]:
+        session["api_token"] = getpass("Enter your Confluence API token (hidden): ")
+
+    return Confluence(
+        url=session["base_url"],
+        username=session["username"],
+        password=session["api_token"],
+        cloud=True,
+    )
+
+# Fetch space structure
+def fetch_space_structure(confluence):
+    """
+    Fetch top-level pages in the space.
+    """
+    print("\nFetching top-level pages in the space...")
+    pages = confluence.get_all_pages_from_space(
+        space=session["space_key"], start=0, limit=100, content_type="page"
+    )
+    if not pages:
+        print("No pages found.")
+        return []
+
+    # Filter for top-level pages (0 or 1 ancestor)
+    top_level_pages = [
+        {
+            "title": page["title"],
+            "id": page["id"],
+            "ancestor_count": len(page.get("_expandable", {}).get("ancestors", [])),
+        }
+        for page in pages
+        if len(page.get("_expandable", {}).get("ancestors", [])) <= 1
+    ]
+
+    if not top_level_pages:
+        print("No top-level pages found.")
+    else:
+        print("\nSpace Structure (Top Pages):")
+        for page in top_level_pages:
+            print(f"- {page['title']} (ID: {page['id']})")
+
+    return top_level_pages
+
+# Validate query
+def validate_query(query):
+    if not query.strip():
+        return "Query cannot be empty."
+    if "text~" in query and "'" not in query:
+        return "Keyword searches must be enclosed in single quotes."
+    return None
+
+# Query builder
+def query_builder():
+    print("\nBuild your query:")
+    keyword = input("Enter a keyword to search for: ").strip()
+    session["query"] = f"text~'{keyword}' AND space='{session['space_key']}'"
+
+    error = validate_query(session["query"])
+    if error:
+        print(f"Query error: {error}")
+        return query_builder()
+
+    print(f"\nYour query: {session['query']}")
+    return session["query"]
+
+# Fetch data from Confluence
+def fetch_confluence_data(confluence):
+    """
+    Fetch data from Confluence using the built query.
+    """
+    query = session.get("query")
+    if not query:
+        print("No query found. Please build a query first.")
+        return []
+
+    results = confluence.cql(query=query, limit=100)["results"]
+    if not results:
+        print("No results found for the query.")
+    else:
+        print(f"Fetched {len(results)} results.")
+    return results
+
+# Save results to CSV
+def save_to_csv(results):
+    """
+    Save search results to a CSV file.
+    """
+    csv_file = f"confluence_export_{session['space_key']}.csv"
+    with open(csv_file, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Title", "ID", "URL"])  # CSV header
+
+        for result in results:
+            title = result["title"]
+            page_id = result["id"]
+            url = f"{session['base_url']}/wiki{result['_links']['webui']}"
+            writer.writerow([title, page_id, url])
+
+    print(f"Results saved to: {csv_file}")
+
+# Check and append macros
+def check_and_append_macros(content):
+    """
+    Check for Version History macro and append if missing.
+    """
+    version_macro = '<ac:structured-macro ac:name="version-history" />'
+    expand_macro_start = '<ac:structured-macro ac:name="expand">'
+    expand_macro_label = '<ac:parameter ac:name="title">Version History</ac:parameter>'
+    expand_macro_end = '</ac:structured-macro>'
+
+    if version_macro in content:
+        print("Version History macro already present.")
+        return content
+
+    print("Adding Version History macro inside Expand macro.")
+    new_macro = f"{expand_macro_start}{expand_macro_label}{version_macro}{expand_macro_end}"
+    return content + "\n\n" + new_macro
+
+# Edit pages
+def edit_pages(confluence, results):
+    """
+    Edit pages by replacing a term and appending macros if needed.
+    """
+    old_term = input("Enter the term to replace: ").strip()
+    new_term = input("Enter the new term: ").strip()
+    comment = input("Enter a comment for this edit: ").strip()
+
+    for result in results:
+        page_id = result["id"]
+        title = result["title"]
+        print(f"Editing page: {title} (ID: {page_id})")
+
+        content = confluence.get_page_by_id(page_id, expand="body.storage")["body"][
+            "storage"
+        ]["value"]
+        updated_content = content.replace(old_term, new_term)
+        updated_content = check_and_append_macros(updated_content)
+
+        confluence.update_page(
+            page_id=page_id,
+            title=title,
+            body=updated_content,
+            minor_edit=True,
+            version_comment=comment,
+        )
+        print(f"Updated page: {title} (ID: {page_id})")
+
+# Main function
+def confluence_tool():
+    """
+    Main tool workflow.
+    """
+    confluence = authenticate()
+
+    print("\nFetching space structure...")
+    fetch_space_structure(confluence)
+
+    print("\nBuilding query...")
+    query_builder()
+
+    print("\nFetching data...")
+    results = fetch_confluence_data(confluence)
+
+    if results:
+        print("\nSaving results to CSV...")
+        save_to_csv(results)
+
+        print("\nEditing pages...")
+        edit_pages(confluence, results)
+
+if __name__ == "__main__":
+    confluence_tool()
