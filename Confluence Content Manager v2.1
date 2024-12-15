@@ -135,7 +135,7 @@ def fetch_confluence_data(confluence):
             cql=session["query"],
             limit=min(FETCH_LIMIT or 100, 100),
             start=start,
-        )["results"]
+        ).get("results", [])
 
         if not batch:
             break
@@ -160,9 +160,9 @@ def save_to_csv(results):
         writer.writerow(["Index", "Title", "URL", "Page ID", "Last Modified", "Author"])  # CSV header
 
         for idx, result in enumerate(results, start=1):
-            title = result.get("title", "Untitled")
+            title = result.get("title", "Untitled").replace("+", " ")
             page_id = result.get("id", "Unknown")
-            link = f"{session['base_url']}/wiki{result['_links']['webui']}"
+            link = f"{session['base_url']}/display/{session['space_key']}/{title.replace(' ', '+')}"
             modified = result.get("version", {}).get("when", "N/A")
             author = result.get("version", {}).get("by", {}).get("displayName", "Unknown")
             writer.writerow([idx, title, link, page_id, modified, author])
