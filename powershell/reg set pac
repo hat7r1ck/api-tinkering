@@ -1,0 +1,59 @@
+# Define paths for batch file and lite script (placeholders)
+$DesktopPath = [Environment]::GetFolderPath("Desktop")
+$LiteScriptPath = "$DesktopPath\Lite.ps1"
+$BatchFilePath = "$DesktopPath\Open.bat"
+
+# Placeholder for the desired PAC script URL
+$DesiredPACUrl = "URL"
+
+# Create the lightweight PowerShell script (LiteTwinwave.ps1)
+if (-Not (Test-Path -Path $LiteScriptPath)) {
+    $LiteScriptContent = @"
+# Define the desired PAC script URL
+\$DesiredPACUrl = '$DesiredPACUrl'
+
+# Path to the registry key (placeholders)
+\$RegistryPath = 'HKCU:\PATH'
+
+# Read the current DefaultConnectionSettings
+\$CurrentSettings = (Get-ItemProperty -Path \$RegistryPath -Name 'DefaultConnectionSettings').DefaultConnectionSettings
+
+# Decode the binary value
+\$DecodedSettings = [System.Text.Encoding]::ASCII.GetString(\$CurrentSettings)
+
+# Check if the PAC script URL is already set
+if (\$DecodedSettings.Contains(\$DesiredPACUrl)) {
+    Write-Host 'PAC script URL is already set.' -ForegroundColor Green
+} else {
+    # Replace the existing PAC script URL or append the new one
+    \$UpdatedSettings = \$DecodedSettings -replace 'http://.*?\.pac', \$DesiredPACUrl
+    \$EncodedSettings = [System.Text.Encoding]::ASCII.GetBytes(\$UpdatedSettings)
+
+    # Write the updated binary value back to the registry
+    Set-ItemProperty -Path \$RegistryPath -Name 'DefaultConnectionSettings' -Value \$EncodedSettings
+    Write-Host 'PAC script URL has been updated.' -ForegroundColor Green
+}
+
+# Open the target URL in the default browser
+Start-Process 'URL in browser'
+
+# Close the PowerShell window
+exit
+"@
+    # Write the Lite script to the desktop
+    $LiteScriptContent | Out-File -FilePath $LiteScriptPath -Encoding ASCII
+    Write-Host "Lite PowerShell script created: Lite.ps1" -ForegroundColor Green
+}
+
+# Create the batch file (OpenTwinwave.bat)
+if (-Not (Test-Path -Path $BatchFilePath)) {
+    $BatchContent = @"
+@echo off
+powershell -ExecutionPolicy Bypass -File ""$LiteScriptPath""
+"@
+    # Write the batch file to the desktop
+    $BatchContent | Out-File -FilePath $BatchFilePath -Encoding ASCII
+    Write-Host "Batch file created: Open.bat" -ForegroundColor Green
+}
+
+Write-Host "Setup complete! Use the batch file 'Open.bat' on your desktop to reset the PAC script and open the target URL." -ForegroundColor Cyan
