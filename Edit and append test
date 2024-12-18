@@ -510,6 +510,7 @@ def check_and_append_macros(confluence, results):
                         # Optionally, set the content inside the rich-text-body
                         rich_text_body = view_history_macro.find('.//ac:rich-text-body', namespaces=namespaces)
                         if rich_text_body is not None:
+                            # Customize the content as needed
                             p_element = etree.Element("{http://www.atlassian.com/schema/confluence}p")
                             p_element.text = "Here is the version history of this page."
                             rich_text_body.append(p_element)
